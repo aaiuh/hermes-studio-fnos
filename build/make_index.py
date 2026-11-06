@@ -172,7 +172,8 @@ def main() -> int:
                 "categories": ["AI赋能"],
                 "icon_url": f"https://raw.githubusercontent.com/{repo}/main/ICON_256.PNG",
                 "preview_urls": [],
-                "readme_url": f"https://github.com/{repo}#readme",
+                # FnDepot 取 readme 时要求「纯文本 md」地址；给仓库 HTML 页会拿到代理站的落地页
+                "readme_url": f"https://raw.githubusercontent.com/{repo}/main/README.md",
                 "bug_report_url": f"https://github.com/{repo}/issues",
                 "maintainer": "aaiuh",
                 "maintainer_url": "https://github.com/aaiuh",

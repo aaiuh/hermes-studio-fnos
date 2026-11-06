@@ -104,7 +104,8 @@ jobs:
 
           # ③ 包内容签名：manifest/cmd/config/wizard/app/build 任一变化都必须重打，
           #    否则新增钩子（如飞牛备份）会被「runtime 未变」错误跳过。
-          SIG="$(find manifest cmd config wizard app build -type f 2>/dev/null \
+          # 只把「会进包的东西」纳入签名：build/ 里是打包工具，改它不该触发重打 540 MB 的包
+          SIG="$(find manifest cmd config wizard app -type f 2>/dev/null \
                   | LC_ALL=C sort \
                   | xargs -r sha256sum 2>/dev/null \
                   | sha256sum | cut -d" " -f1)"
