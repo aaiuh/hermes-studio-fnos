@@ -52,6 +52,18 @@
               "size": 540165010
             }
           }
+        },
+        "0.8.17-5": {
+          "changelog": "跟随官方 runtime（Agent 0.23.0，控制台 0.8.17）。内嵌官方 Agent 运行时，空白机器全新安装即可用；控制台可在 Studio 内直接更新；支持飞牛应用数据备份与还原。",
+          "updated_at": "2026-11-06",
+          "os_min_version": "1.1.0",
+          "packages": {
+            "x86": {
+              "download_url": "https://github.com/aaiuh/hermes-studio-fnos/releases/download/v0.8.17-5/./Hermes.fpk",
+              "sha256": "1065ec47e68b34c8d51396dfaa7d74724bf1fbf96844d80593d3550ba1a702c4",
+              "size": 540165060
+            }
+          }
         }
       }
     }
