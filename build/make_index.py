@@ -68,6 +68,7 @@ def main() -> int:
             print("找不到 .fpk，跳过索引生成")
             return 0
         fpk = cands[0]
+    fpk = os.path.basename(fpk)
     fpk_path = os.path.join(ROOT, fpk)
 
     manifest = read_manifest(os.path.join(ROOT, "manifest"))
@@ -122,6 +123,30 @@ def main() -> int:
             }
         },
     }
+
+    # 剔除指向已删除 Release 的残留条目：URL 取不到就不该留在索引里，
+    # 否则 FnDepot 会把它当成可安装版本。
+    alive = {}
+    for v, r in releases.items():
+        url = (((r or {}).get("packages") or {}).get("x86") or {}).get("download_url", "")
+        if v == version:
+            alive[v] = r
+            continue
+        ok = False
+        if url:
+            try:
+                import urllib.request
+
+                req = urllib.request.Request(url, method="HEAD")
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    ok = 200 <= resp.status < 400
+            except Exception:
+                ok = False
+        if ok:
+            alive[v] = r
+        else:
+            print(f"  丢弃无效版本 {v}（下载地址不可达）")
+    releases = alive
 
     # 只保留最近 15 个版本，避免索引无限膨胀
     keep = sorted(releases.keys(), key=_ver_key)[-15:]
