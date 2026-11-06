@@ -1,0 +1,152 @@
+#!/bin/bash
+# ============================================================================
+# 飞牛「应用数据备份」钩子 —— 备份
+# fnOS 存储空间 → 应用数据备份 会调用本脚本，把数据写进 $TRIM_BACKUP_DIR/data/
+#
+# 备份内容（整份 home，可完整还原）：
+#   .hermes          配置 / 记忆 / profiles / 技能 / 会话库 / cron / 插件
+#   .hermes-web-ui   控制台数据库、上传附件、人物记忆
+#   .ssh             部署密钥（还原后免重新配）
+#   .git-credentials* / .dsh 等点文件
+# 排除：纯缓存与可重新下载的二进制（cache/logs/tools/lsp/snapshots/telemetry、
+#       .npm/.pub-cache/.dartServer/.dart-tool/.android/.local、node_modules、__pycache__）
+# ============================================================================
+set -uo pipefail
+
+: "${TRIM_APPDEST:?TRIM_APPDEST 未设置}"
+: "${TRIM_PKGVAR:?TRIM_PKGVAR 未设置}"
+
+CMD_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOG="/tmp/hermes-backup-$(date +%Y%m%d-%H%M%S).log"
+exec > >(tee -a "$LOG") 2>&1
+
+say() { echo "[backup] $*"; }
+fail() { echo "[backup] 失败：$*" >&2; exit 1; }
+
+HOME_ROOT="${TRIM_DATA_SHARE_PATHS%%:*}"
+[ -n "${HOME_ROOT}" ] || fail "TRIM_DATA_SHARE_PATHS 为空，无法定位数据目录"
+
+BACKUP_DIR="${TRIM_BACKUP_DATA_DIR:-}"
+if [ -z "${BACKUP_DIR}" ]; then
+    : "${TRIM_BACKUP_DIR:?TRIM_BACKUP_DIR 或 TRIM_BACKUP_DATA_DIR 必须有一个}"
+    BACKUP_DIR="${TRIM_BACKUP_DIR}/data"
+fi
+mkdir -p "${BACKUP_DIR}" || fail "无法创建备份目录 ${BACKUP_DIR}"
+chmod a+rx "${BACKUP_DIR}" 2>/dev/null || true
+
+say "数据目录 = ${HOME_ROOT}"
+say "备份目录 = ${BACKUP_DIR}"
+[ -d "${HOME_ROOT}/.hermes" ] || fail "${HOME_ROOT}/.hermes 不存在，没有可备份的数据"
+
+# ---------- 1. 停服务（保证 sqlite 一致） ----------
+WAS_RUNNING=0
+if [ -x "${CMD_DIR}/main" ] && "${CMD_DIR}/main" status >/dev/null 2>&1; then
+    WAS_RUNNING=1
+    say "停服务以保证数据库一致…"
+    "${CMD_DIR}/main" stop || say "警告：stop 返回非 0，继续备份"
+    for i in $(seq 1 30); do
+        pgrep -f "hermes-web-ui|hermes_bridge|hermes gateway" >/dev/null 2>&1 || break
+        sleep 2
+    done
+fi
+
+start_back() {
+    if [ "${WAS_RUNNING}" = "1" ] && [ -x "${CMD_DIR}/main" ]; then
+        say "重新拉起服务…"
+        "${CMD_DIR}/main" start >/dev/null 2>&1 || say "警告：服务未能自动拉起，请在应用中心手动启动"
+    fi
+}
+
+# ---------- 2. 打包 ----------
+OUT="${BACKUP_DIR}/hermes-home.tar.gz"
+rm -f "${OUT}"
+COMP="gzip -6"
+command -v pigz >/dev/null 2>&1 && COMP="pigz -1"
+say "开始打包（压缩器：${COMP}）…"
+T0=$(date +%s)
+
+EXCLUDES=(
+    --exclude='.hermes/cache'
+    --exclude='.hermes/logs'
+    --exclude='.hermes/tools'
+    --exclude='.hermes/lsp'
+    --exclude='.hermes/state-snapshots'
+    --exclude='.hermes/telemetry'
+    --exclude='.hermes/plugins/*/.git/objects'
+    --exclude='.cache'
+    --exclude='.npm'
+    --exclude='.pub-cache'
+    --exclude='.dartServer'
+    --exclude='.dart-tool'
+    --exclude='.android'
+    --exclude='.local'
+    --exclude='.upgrade-keep'
+    --exclude='*.new-install'
+    --exclude='node_modules'
+    --exclude='__pycache__'
+    --exclude='*.pyc'
+    --exclude='*-wal'
+    --exclude='*-shm'
+)
+
+# 用 GNU tar 的 --ignore-failed-read：个别属主为 root 的文件读不到时不至于整体失败
+# 只写通配：具体凭据文件名属于私有信息，不能出现在公开仓库里
+tar --ignore-failed-read --wildcards -cf - -C "${HOME_ROOT}" "${EXCLUDES[@]}" \
+    .hermes .hermes-web-ui .ssh .config .dsh '.git-credentials*' \
+    2> "${BACKUP_DIR}/tar-warnings.txt" | ${COMP} > "${OUT}"
+RC=${PIPESTATUS[0]}
+T1=$(date +%s)
+
+if [ "${RC}" -ne 0 ] && [ "${RC}" -ne 1 ]; then
+    start_back
+    fail "tar 返回 ${RC}（详见 ${BACKUP_DIR}/tar-warnings.txt）"
+fi
+[ -s "${OUT}" ] || { start_back; fail "产物为空"; }
+
+SIZE=$(stat -c %s "${OUT}")
+say "打包完成：${OUT}  $((SIZE/1024/1024)) MB  耗时 $((T1-T0))s"
+
+# ---------- 3. 自检 ----------
+say "自检：清点包内条目…"
+# 只读一次归档：3 GB 的包反复 tar tzf 会把备份拖成十几分钟
+LIST="$(mktemp /tmp/hermes-bklist-XXXXXX)"
+tar tzf "${OUT}" > "${LIST}" 2>/dev/null
+COUNT=$(wc -l < "${LIST}")
+[ "${COUNT}" -gt 100 ] || { start_back; fail "包内只有 ${COUNT} 个条目，疑似损坏"; }
+say "包内条目：${COUNT}"
+
+# 关键文件必须在
+for must in ".hermes/config.yaml" ".hermes/state.db" ".hermes-web-ui/hermes-web-ui.db"; do
+    if grep -qxF "$must" "${LIST}"; then
+        say "  ✓ ${must}"
+    else
+        rm -f "${LIST}" 2>/dev/null || true
+        start_back
+        fail "缺少关键文件 ${must}"
+    fi
+done
+
+SHA=$(sha256sum "${OUT}" | cut -d' ' -f1)
+{
+    echo "app=Hermes"
+    echo "created=$(date '+%F %T')"
+    echo "home=${HOME_ROOT}"
+    echo "file=hermes-home.tar.gz"
+    echo "bytes=${SIZE}"
+    echo "entries=${COUNT}"
+    echo "sha256=${SHA}"
+    echo "package_version=$(cat "${TRIM_APPDEST}/VERSION" 2>/dev/null || echo unknown)"
+    echo "agent_version=$(cat "${TRIM_APPDEST}/AGENT_VERSION" 2>/dev/null || echo unknown)"
+} > "${BACKUP_DIR}/backup-info.txt"
+chmod a+r "${OUT}" "${BACKUP_DIR}/backup-info.txt" 2>/dev/null || true
+chmod -R a+rX "${BACKUP_DIR}" 2>/dev/null || true
+
+WARN=$(wc -l < "${BACKUP_DIR}/tar-warnings.txt" 2>/dev/null || echo 0)
+[ "${WARN}" -gt 0 ] && say "读取告警 ${WARN} 条（见 tar-warnings.txt，通常是 root 属主的历史文件）"
+
+rm -f "${LIST}" 2>/dev/null || true
+
+say "sha256=${SHA}"
+say "完成 ✅"
+start_back
+exit 0

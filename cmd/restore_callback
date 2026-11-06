@@ -1,0 +1,120 @@
+#!/bin/bash
+# ============================================================================
+# 飞牛「应用数据备份」钩子 —— 还原
+# fnOS 会把备份内容解到 $TRIM_BACKUP_DIR/data/，本脚本把它写回数据目录并拉起服务。
+#
+# 安全策略：
+#   1. 先停服务
+#   2. 现有数据整体改名成 .before-restore-<时间戳>（同盘 rename，瞬时且不丢）
+#   3. 解包
+#   4. 校验关键文件；校验不过就把旧数据挪回来并报错
+# ============================================================================
+set -uo pipefail
+
+: "${TRIM_APPDEST:?TRIM_APPDEST 未设置}"
+: "${TRIM_PKGVAR:?TRIM_PKGVAR 未设置}"
+
+CMD_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOG="/tmp/hermes-restore-$(date +%Y%m%d-%H%M%S).log"
+exec > >(tee -a "$LOG") 2>&1
+
+say() { echo "[restore] $*"; }
+fail() { echo "[restore] 失败：$*" >&2; exit 1; }
+
+HOME_ROOT="${TRIM_DATA_SHARE_PATHS%%:*}"
+[ -n "${HOME_ROOT}" ] || fail "TRIM_DATA_SHARE_PATHS 为空"
+
+SRC_DIR="${TRIM_BACKUP_DATA_DIR:-${TRIM_BACKUP_DIR:-}/data}"
+[ -d "${SRC_DIR}" ] || fail "备份目录不存在：${SRC_DIR}"
+
+TAR="${SRC_DIR}/hermes-home.tar.gz"
+[ -f "${TAR}" ] || fail "备份文件不存在：${TAR}"
+
+say "备份源 = ${TAR}  ($(stat -c %s "$TAR") B)"
+[ -f "${SRC_DIR}/backup-info.txt" ] && sed 's/^/    /' "${SRC_DIR}/backup-info.txt"
+
+# ---------- 1. 校验归档可读 ----------
+say "校验归档完整性…"
+if ! tar tzf "${TAR}" >/dev/null 2>&1; then
+    fail "归档无法读取，放弃还原（现有数据未改动）"
+fi
+say "  ✓ 归档可读"
+
+# ---------- 2. 停服务 ----------
+if [ -x "${CMD_DIR}/main" ]; then
+    "${CMD_DIR}/main" stop >/dev/null 2>&1 || true
+    for i in $(seq 1 30); do
+        pgrep -f "hermes-web-ui|hermes_bridge|hermes gateway" >/dev/null 2>&1 || break
+        sleep 2
+    done
+fi
+say "服务已停止"
+
+# ---------- 3. 现有数据挪开 ----------
+ASIDE=""
+if [ -d "${HOME_ROOT}" ] && [ "$(ls -A "${HOME_ROOT}" 2>/dev/null | wc -l)" -gt 0 ]; then
+    ASIDE="${HOME_ROOT}.before-restore-$(date +%Y%m%d-%H%M%S)"
+    say "现有数据挪到：${ASIDE}"
+    mv "${HOME_ROOT}" "${ASIDE}" || fail "无法挪开现有数据，已中止（数据未改动）"
+fi
+
+mkdir -p "${HOME_ROOT}" || fail "无法创建 ${HOME_ROOT}"
+
+# ---------- 4. 解包 ----------
+say "解包中…"
+if ! tar xzf "${TAR}" -C "${HOME_ROOT}" --no-same-owner 2>"${SRC_DIR}/restore-warnings.txt"; then
+    say "解包出错，回滚"
+    rm -rf "${HOME_ROOT}"
+    [ -n "${ASIDE}" ] && mv "${ASIDE}" "${HOME_ROOT}"
+    fail "解包失败，已回滚到还原前状态"
+fi
+
+# ---------- 5. 校验关键文件 ----------
+say "校验关键文件…"
+BAD=0
+for must in ".hermes/config.yaml" ".hermes/state.db" ".hermes-web-ui/hermes-web-ui.db"; do
+    if [ -f "${HOME_ROOT}/${must}" ]; then
+        say "  ✓ ${must}  $(stat -c %s "${HOME_ROOT}/${must}") B"
+    else
+        say "  ✗ ${must} 缺失"; BAD=1
+    fi
+done
+if [ "${BAD}" = "1" ]; then
+    say "关键文件缺失，回滚"
+    rm -rf "${HOME_ROOT}"
+    [ -n "${ASIDE}" ] && mv "${ASIDE}" "${HOME_ROOT}"
+    fail "还原内容不完整，已回滚"
+fi
+
+# ---------- 6. 权限 ----------
+say "修正归属…"
+chown -R Hermes:Hermes "${HOME_ROOT}" 2>/dev/null || say "警告：chown 失败（请检查应用账号）"
+chmod 700 "${HOME_ROOT}" 2>/dev/null || true
+
+# 清理 sqlite 残留，避免读到旧 wal
+find "${HOME_ROOT}/.hermes" "${HOME_ROOT}/.hermes-web-ui" -maxdepth 1 -name '*-wal' -o -maxdepth 1 -name '*-shm' 2>/dev/null | while read -r f; do
+    rm -f "$f" && say "  清理残留 $(basename "$f")"
+done
+
+# ---------- 7. 修正程序路径（还原后 npm 前缀与 node 路径必须指向当前安装） ----------
+NODE_BIN="$(readlink -f /var/apps/nodejs_v24/target/bin/node 2>/dev/null)"
+if [ -n "${NODE_BIN}" ] && [ -x "${NODE_BIN}" ]; then
+    for f in "${HOME_ROOT}/.hermes/config.yaml" "${HOME_ROOT}"/.hermes/profiles/*/config.yaml; do
+        [ -f "$f" ] || continue
+        grep -q "@appdata/Hermes/node/bin/node\|@appcenter/Hermes/server/lib/node_modules/hermes-web-ui" "$f" 2>/dev/null || continue
+        cp -a "$f" "${f}.bak-restore-$(date +%Y%m%d-%H%M%S)"
+        sed -i -e "s|/vol1/@appdata/Hermes/node/bin/node|${NODE_BIN}|g" \
+               -e "s|/vol1/@appcenter/Hermes/server/lib/node_modules/hermes-web-ui|${TRIM_PKGVAR}/npm/lib/node_modules/hermes-web-ui|g" "$f"
+        say "  路径已修正：$(basename "$(dirname "$f")")"
+    done
+fi
+
+# ---------- 8. 拉起 ----------
+if [ -x "${CMD_DIR}/main" ]; then
+    say "拉起服务…"
+    "${CMD_DIR}/main" start >/dev/null 2>&1 || say "警告：服务未能自动拉起，请在应用中心手动启动"
+fi
+
+say "还原完成 ✅（还原前的旧数据保留在：${ASIDE:-无}）"
+say "确认无误后可删除旧数据：rm -rf '${ASIDE}'"
+exit 0

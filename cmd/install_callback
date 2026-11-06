@@ -1,0 +1,300 @@
+#!/bin/bash
+# Hermes Studio — 安装回调（幂等，升级复用同一套逻辑）
+#
+# 职责：
+#   1. 复用系统 nodejs_v24，控制台装到可写的 npm 全局前缀
+#   2. 从升级暂存区恢复 Agent 运行时（server/lib/node_modules/hermes-agent）
+#   3. 重建 server/bin 软链
+#   4. 修正用户配置里硬编码的旧包路径（MCP 启动命令）
+
+set -u
+
+TRIM_APPDEST="${TRIM_APPDEST:-/vol1/@appcenter/Hermes}"
+TRIM_PKGVAR="${TRIM_PKGVAR:-/vol1/@appdata/Hermes}"
+HOME_ROOT="${TRIM_DATA_SHARE_PATHS%%:*}"
+[ -n "${HOME_ROOT}" ] || HOME_ROOT="/vol1/@appshare/Hermes"
+
+HERMES_HOME="${HOME_ROOT}/.hermes"
+NPM_PREFIX="${TRIM_PKGVAR}/npm"
+KEEP_DIR="${HOME_ROOT}/.upgrade-keep"
+LOG_FILE="${TRIM_PKGVAR}/info.log"
+WEBUI_VER="$(cat "${TRIM_APPDEST}/VERSION" 2>/dev/null | tr -d '[:space:]')"
+WEBUI_VER="${WEBUI_VER:-latest}"
+
+mkdir -p "${TRIM_PKGVAR}" 2>/dev/null || true
+DBG_FILE="${TRIM_PKGVAR}/callback.log"
+log_msg() {
+    local line
+    line="$(date '+%Y-%m-%d %H:%M:%S') - [install] $1"
+    echo "${line}" >> "${LOG_FILE}" 2>/dev/null || true
+    echo "${line}" >> "${DBG_FILE}"  2>/dev/null || true
+}
+log_msg "=== install_callback start (webui=${WEBUI_VER}) ==="
+log_msg "APPDESt=${TRIM_APPDEST} PKGVAR=${TRIM_PKGVAR} HOMEROOT=${HOME_ROOT} DATA_SHARE=${TRIM_DATA_SHARE_PATHS:-<空>}"
+log_msg "APPDEST 内容: $(ls -A "${TRIM_APPDEST}" 2>/dev/null | tr '\n' ' ')"
+log_msg "var/apps 内容: $(ls -A "/var/apps/$(basename "${TRIM_APPDEST}")" 2>/dev/null | tr '\n' ' ')"
+
+# ── 1. 找 node ────────────────────────────────────────────────
+resolve_node() {
+    local c
+    for c in /var/apps/nodejs_v24/target/bin/node \
+             /var/apps/nodejs_v24/target/bin/nodejs \
+             /vol1/@appcenter/nodejs_v24/bin/node \
+             /vol2/@appcenter/nodejs_v24/bin/node
+    do
+        [ -x "$c" ] && { echo "$c"; return 0; }
+    done
+    command -v node 2>/dev/null && return 0
+    return 1
+}
+NODE_BIN="$(resolve_node)" || {
+    log_msg "ERROR: Node.js runtime not found (need nodejs_v24)"
+    echo "ERROR: 需要先安装 Node.js 24（应用中心 → nodejs_v24）" >&2
+    exit 1
+}
+NODE_DIR="$(dirname "${NODE_BIN}")"
+# npm 是 `#!/usr/bin/env node` 脚本，PATH 里没有 node 时它直接报
+# "/usr/bin/env: 'node': No such file or directory" —— 必须先把 node 目录放进 PATH
+export PATH="${NODE_DIR}:${PATH}"
+log_msg "node=${NODE_BIN} npm=$(command -v npm 2>/dev/null || echo 未找到) PATH 已含 node 目录"
+
+NPM_CLI=""
+for c in "${NODE_DIR}/npm" /var/apps/nodejs_v24/target/bin/npm; do
+    [ -f "$c" ] && { NPM_CLI="$c"; break; }
+done
+[ -n "${NPM_CLI}" ] || log_msg "WARN: npm not found next to ${NODE_BIN}"
+
+AGENT_VER="$(cat "${TRIM_APPDEST}/AGENT_VERSION" 2>/dev/null | tr -d '[:space:]')"
+[ -n "${AGENT_VER}" ] || AGENT_VER="latest"
+log_msg "agent target version=${AGENT_VER}"
+
+# ── 2. Agent 运行时：升级复用 / 全新安装从包内解压 ──────────────
+AGENT_DIR="${TRIM_APPDEST}/server/lib/node_modules/hermes-agent"
+AGENT_VENV="${AGENT_DIR}/runtime/hermes-agent/venv/bin/hermes"
+agent_ok() { [ -x "${AGENT_VENV}" ]; }
+
+install_agent_runtime() {
+    if agent_ok; then log_msg "agent runtime OK"; return 0; fi
+
+    # ① 升级路径：upgrade_init 已把它挪到 .upgrade-keep（@appshare，升级/卸载都不删）
+    if [ -d "${KEEP_DIR}/server/lib/node_modules/hermes-agent" ]; then
+        log_msg "restoring agent runtime from ${KEEP_DIR}"
+        rm -rf "${AGENT_DIR}"
+        mkdir -p "${AGENT_DIR%/*}" 2>/dev/null || true
+        mv "${KEEP_DIR}/server/lib/node_modules/hermes-agent" "${AGENT_DIR}" 2>/dev/null \
+            || cp -a "${KEEP_DIR}/server/lib/node_modules/hermes-agent" "${AGENT_DIR}" 2>/dev/null \
+            || log_msg "WARN: restore failed"
+        if agent_ok; then log_msg "agent runtime restored"; return 0; fi
+    fi
+
+    # ② 全新安装：解压包内 runtime.tar.gz（官方 linux-x64，含 venv 与相对软链）
+    #     fnOS 把 app.tgz 解到哪个前缀并无公开约定，这里多路径探测 + 全盘兜底。
+    local TAR=""
+    local cand
+    for cand in \
+        "${TRIM_APPDEST}/runtime.tar.gz" \
+        "${TRIM_APPDEST}/app/runtime.tar.gz" \
+        "${TRIM_APPDEST}/ui/../runtime.tar.gz" \
+        "${TRIM_APPDEST}/server/../runtime.tar.gz" \
+        "${TRIM_APPDEST}/target/runtime.tar.gz" \
+        "/var/apps/$(basename "${TRIM_APPDEST}")/runtime.tar.gz" \
+        "/var/apps/$(basename "${TRIM_APPDEST}")/target/runtime.tar.gz"
+    do
+        if [ -f "${cand}" ]; then TAR="$(readlink -f "${cand}")"; break; fi
+    done
+    if [ -z "${TAR}" ]; then
+        TAR="$(find "${TRIM_APPDEST}" /var/apps/"$(basename "${TRIM_APPDEST}")" -maxdepth 4 -name 'runtime.tar.gz' -type f 2>/dev/null | head -1)"
+    fi
+    if [ -z "${TAR}" ] || [ ! -f "${TAR}" ]; then
+        log_msg "ERROR: 找不到 runtime.tar.gz。TRIM_APPDEST=${TRIM_APPDEST} 内容如下："
+        ls -A "${TRIM_APPDEST}" 2>&1 | sed 's/^/    /' | while read -r l; do log_msg "    ${l}"; done
+        log_msg "ERROR: 无 runtime —— 中止（不静默跳过）"
+        return 1
+    fi
+    log_msg "runtime tar = ${TAR} ($(stat -c %s "${TAR}" 2>/dev/null) B)"
+
+    # npm 包只提供 bin/lib/package.json（148 KB）；不跑 postinstall（那要 git clone + pip，需外网）
+    if [ ! -f "${AGENT_DIR}/package.json" ]; then
+        local spec="hermes-agent"
+        [ "${AGENT_VER}" != "latest" ] && spec="hermes-agent@${AGENT_VER}"
+        log_msg "npm wrapper: ${spec} --prefix ${TRIM_APPDEST}/server --ignore-scripts"
+        "${NPM_CLI}" install -g "${spec}" \
+            --prefix "${TRIM_APPDEST}/server" \
+            --ignore-scripts --no-audit --no-fund --loglevel=warn >> "${LOG_FILE}" 2>&1 \
+            || log_msg "WARN: hermes-agent npm wrapper install failed"
+    fi
+
+    local TMP
+    TMP="$(mktemp -d "${TRIM_PKGVAR}/.rt-XXXXXX" 2>/dev/null || mktemp -d)"
+    if ! tar xzf "${TAR}" -C "${TMP}" 2>>"${LOG_FILE}"; then
+        log_msg "ERROR: runtime.tar.gz 解压失败"
+        rm -rf "${TMP}" 2>/dev/null
+        return 1
+    fi
+    mkdir -p "${AGENT_DIR}" 2>/dev/null || true
+
+    # 分支 A：包内就是完整的 runtime/ 目录（本机组装包：hermes-agent/ + python/）
+    #         整体覆盖最稳 —— venv 里可能是指向 runtime/python 的绝对软链，少复制一个就会断。
+    if [ -d "${TMP}/runtime/hermes-agent" ] && [ -x "${TMP}/runtime/hermes-agent/venv/bin/hermes" ]; then
+        log_msg "bulk runtime layout detected (runtime/hermes-agent + runtime/python)"
+        rm -rf "${AGENT_DIR}/runtime"
+        mv "${TMP}/runtime" "${AGENT_DIR}/runtime" 2>/dev/null \
+            || cp -a "${TMP}/runtime" "${AGENT_DIR}/runtime" 2>/dev/null
+        log_msg "runtime/ replaced wholesale"
+    # 分支 B：官方 runtime 包，Agent 本体在 ./python/（含 .git 与 venv）
+    elif [ -d "${TMP}/python" ] && [ -x "${TMP}/python/venv/bin/hermes" ]; then
+        mkdir -p "${AGENT_DIR}/runtime" 2>/dev/null || true
+        rm -rf "${AGENT_DIR}/runtime/hermes-agent"
+        mv "${TMP}/python" "${AGENT_DIR}/runtime/hermes-agent" 2>/dev/null \
+            || cp -a "${TMP}/python" "${AGENT_DIR}/runtime/hermes-agent" 2>/dev/null
+        log_msg "official layout: python/ -> runtime/hermes-agent"
+        # 官方包若另带 CPython 目录也一并放好（venv 可能引用它）
+        for cpdir in "${TMP}/cpython"* "${TMP}/python-build"*; do
+            [ -d "${cpdir}" ] && cp -a "${cpdir}" "${AGENT_DIR}/runtime/" 2>/dev/null && log_msg "extra python dir: $(basename "${cpdir}")"
+        done
+    # 分支 C：兜底，就地搜 venv/bin/hermes
+    else
+        local found body
+        found="$(find "${TMP}" -maxdepth 5 -path '*/venv/bin/hermes' -type f 2>/dev/null | head -1)"
+        if [ -n "${found}" ]; then
+            body="$(cd "$(dirname "${found}")/../.." && pwd)"
+            log_msg "fallback: agent body at ${body}"
+            mkdir -p "${AGENT_DIR}/runtime" 2>/dev/null || true
+            rm -rf "${AGENT_DIR}/runtime/hermes-agent"
+            cp -a "${body}" "${AGENT_DIR}/runtime/hermes-agent" 2>/dev/null
+            # 同级若存在 python/cpython-* 也带上，避免解释器断链
+            local sib
+            sib="$(dirname "${body}")"
+            [ -d "${sib}/python" ] && cp -a "${sib}/python" "${AGENT_DIR}/runtime/" 2>/dev/null \
+                && log_msg "fallback: also carried ${sib}/python"
+        fi
+    fi
+
+    [ -f "${TMP}/runtime-manifest.json" ] && cp -f "${TMP}/runtime-manifest.json" "${AGENT_DIR}/runtime/" 2>/dev/null
+    rm -rf "${TMP}" 2>/dev/null
+
+    if agent_ok; then log_msg "agent runtime ready: ${AGENT_VENV}"; return 0; fi
+    log_msg "ERROR: 解压后仍找不到 ${AGENT_VENV}"
+    return 1
+}
+
+install_agent_runtime || true
+agent_ok && log_msg "agent runtime verified" || log_msg "WARN: Agent 不可用（Studio 界面仍可启动）"
+
+# ── 3. 装控制台到可写 npm 前缀 ────────────────────────────────
+mkdir -p "${NPM_PREFIX}" 2>/dev/null || true
+export NPM_CONFIG_PREFIX="${NPM_PREFIX}"
+export PATH="${NODE_DIR}:${PATH}"
+
+install_webui() {
+    local spec="$1"
+    log_msg "npm install -g ${spec} --prefix ${NPM_PREFIX} --ignore-scripts"
+    # 🔴 必须 --ignore-scripts：node-pty@1.1.0 的 npm 包只带 win32/darwin 预编译，
+    #    linux-x64 没有 prebuilds 目录 → install 脚本回退到 node-gyp →
+    #    飞牛上通常没有 g++ → 编译失败 → 整个 npm install 回滚，装出个空目录。
+    #    实测：带 --allow-scripts 时 41 秒失败、prefix 只剩 20K。
+    "${NPM_CLI}" install -g "${spec}" \
+        --prefix "${NPM_PREFIX}" \
+        --ignore-scripts \
+        --no-audit --no-fund --loglevel=warn >> "${LOG_FILE}" 2>&1
+    local rc=$?
+    log_msg "npm install exit=${rc}"
+    return ${rc}
+}
+
+# node-pty 的 Linux 原生模块不可能在安装期编译，从旧包/暂存区借已编译的 pty.node。
+# 借不到不影响 Studio 启动（它只在打开终端时才 require），但要记 WARN。
+fix_node_pty() {
+    local dest="${NPM_PREFIX}/lib/node_modules/hermes-web-ui/node_modules/node-pty/build/Release"
+    [ -d "${NPM_PREFIX}/lib/node_modules/hermes-web-ui/node_modules/node-pty" ] || return 0
+    [ -f "${dest}/pty.node" ] && { log_msg "node-pty already patched"; return 0; }
+
+    local src
+    for src in \
+        "${KEEP_DIR}/pty.node" \
+        "${TRIM_APPDEST}/vendor/pty.node" \
+        "${TRIM_APPDEST}/pty.node" \
+        "${HOME_ROOT}/.upgrade-keep/pty.node"
+    do
+        if [ -f "${src}" ]; then
+            mkdir -p "${dest}" 2>/dev/null || true
+            if cp -a "${src}" "${dest}/pty.node" 2>/dev/null; then
+                log_msg "node-pty pty.node 已从 ${src} 复用"
+                return 0
+            fi
+        fi
+    done
+    # 兜底：全盘找一份已编译的 pty.node（旧安装残留也算）
+    src="$(find "${TRIM_APPDEST}" /var/apps/"$(basename "${TRIM_APPDEST}")" "${HOME_ROOT}/.upgrade-keep" \
+             -maxdepth 8 -name pty.node -type f 2>/dev/null | head -1)"
+    if [ -n "${src}" ]; then
+        mkdir -p "${dest}" 2>/dev/null || true
+        cp -a "${src}" "${dest}/pty.node" 2>/dev/null && { log_msg "node-pty pty.node 兜底复用: ${src}"; return 0; }
+    fi
+    log_msg "WARN: 未找到可复用的 pty.node —— Web 终端功能不可用（其余功能正常）"
+    return 1
+}
+
+WEBUI_JS="${NPM_PREFIX}/lib/node_modules/hermes-web-ui/bin/hermes-web-ui.mjs"
+if [ -f "${WEBUI_JS}" ] && [ "${WEBUI_VER}" != "latest" ]; then
+    cur="$(node -e "try{console.log(require('${NPM_PREFIX}/lib/node_modules/hermes-web-ui/package.json').version)}catch(e){console.log('')}" 2>/dev/null)"
+    if [ "${cur}" = "${WEBUI_VER}" ]; then
+        log_msg "web-ui already ${cur}, skip install"
+    else
+        install_webui "hermes-web-ui@${WEBUI_VER}" || log_msg "WARN: web-ui install failed, keeping ${cur}"
+    fi
+else
+    install_webui "hermes-web-ui@${WEBUI_VER}" || log_msg "WARN: web-ui install failed"
+fi
+
+# node-pty 原生模块：不可能在安装期编译（无 g++、包内无 linux prebuilds），替用已编译产物
+fix_node_pty || true
+
+# ── 4. 重建 server/bin 软链 ───────────────────────────────────
+mkdir -p "${TRIM_APPDEST}/server/bin"
+NK="${TRIM_APPDEST}/server/lib/node_modules"
+ln -sfn "${NPM_PREFIX}/lib/node_modules/hermes-web-ui/bin/hermes-web-ui.mjs"     "${TRIM_APPDEST}/server/bin/hermes-web-ui"
+ln -sfn "${NPM_PREFIX}/lib/node_modules/hermes-web-ui/bin/ekko-studio-web.mjs"   "${TRIM_APPDEST}/server/bin/ekko-studio-web"
+ln -sfn "${NPM_PREFIX}/lib/node_modules/hermes-web-ui/bin/ekko-studio-mcp.mjs"   "${TRIM_APPDEST}/server/bin/ekko-studio-mcp"
+ln -sfn "${NPM_PREFIX}/lib/node_modules/hermes-web-ui/bin/hermes-studio-mcp.mjs" "${TRIM_APPDEST}/server/bin/hermes-studio-mcp"
+ln -sfn "${NPM_PREFIX}/lib/node_modules/hermes-web-ui/bin/hermes-web-ui-mcp.mjs" "${TRIM_APPDEST}/server/bin/hermes-web-ui-mcp"
+for b in hermes hermes-agent hermes-npm; do
+    [ -f "${NK}/hermes-agent/bin/${b}.js" ] && ln -sfn "${NK}/hermes-agent/bin/${b}.js" "${TRIM_APPDEST}/server/bin/${b}"
+done
+
+# ── 5. 修正用户配置里硬编码的旧包路径 ─────────────────────────
+# 旧包写死了 @appdata/Hermes/node/bin/node 与 @appcenter/.../hermes-web-ui/...，
+# 新包 node 走系统、web-ui 走 npm 前缀，不改就会让所有 MCP 服务起不来。
+MCP_JS="${NPM_PREFIX}/lib/node_modules/hermes-web-ui/bin/ekko-studio-mcp.mjs"
+fix_cfg() {
+    local f="$1"
+    [ -f "$f" ] || return 0
+    grep -q "@appdata/Hermes/node/bin/node\|@appcenter/Hermes/server/lib/node_modules/hermes-web-ui" "$f" 2>/dev/null || return 0
+    cp -a "$f" "${f}.bak-pathfix-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+    OLD_NODE="/vol1/@appdata/Hermes/node/bin/node" \
+    NEW_NODE="${NODE_BIN}" \
+    OLD_MCP="/vol1/@appcenter/Hermes/server/lib/node_modules/hermes-web-ui/bin/ekko-studio-mcp.mjs" \
+    NEW_MCP="${MCP_JS}" \
+    python3 - "$f" <<'PY' 2>/dev/null || log_msg "WARN: path fix failed for $f"
+import os, sys
+p = sys.argv[1]
+t = open(p, encoding="utf-8").read()
+o = t
+t = t.replace(os.environ["OLD_NODE"], os.environ["NEW_NODE"])
+t = t.replace(os.environ["OLD_MCP"], os.environ["NEW_MCP"])
+if t != o:
+    open(p, "w", encoding="utf-8").write(t)
+    print("fixed", p)
+PY
+    log_msg "pathfix: $f"
+}
+fix_cfg "${HERMES_HOME}/config.yaml"
+for f in "${HERMES_HOME}"/profiles/*/config.yaml; do fix_cfg "$f"; done
+
+# ── 6. 归属与权限 ─────────────────────────────────────────────
+chmod -R u+rwX "${NPM_PREFIX}" 2>/dev/null || true
+chmod +x "${TRIM_APPDEST}/cmd/"* 2>/dev/null || true
+[ -d "${HERMES_HOME}" ] && chmod -R u+rwX "${HERMES_HOME}" 2>/dev/null || true
+
+log_msg "=== install_callback end ==="
+exit 0

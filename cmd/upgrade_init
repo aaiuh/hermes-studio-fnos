@@ -1,0 +1,48 @@
+#!/bin/bash
+# 升级前：把 Agent 运行时挪到 @appshare/<app>/.upgrade-keep（升级与卸载都不覆盖该卷）
+set -u
+TRIM_APPDEST="${TRIM_APPDEST:-/vol1/@appcenter/Hermes}"
+TRIM_PKGVAR="${TRIM_PKGVAR:-/vol1/@appdata/Hermes}"
+HOME_ROOT="${TRIM_DATA_SHARE_PATHS%%:*}"
+[ -n "${HOME_ROOT}" ] || HOME_ROOT="/vol1/@appshare/Hermes"
+KEEP_DIR="${HOME_ROOT}/.upgrade-keep"
+LOG_FILE="${TRIM_PKGVAR}/info.log"
+log_msg() { echo "$(date '+%Y-%m-%d %H:%M:%S') - [upgrade_init] $1" >> "${LOG_FILE}" 2>/dev/null || true; }
+
+SRC="${TRIM_APPDEST}/server/lib/node_modules/hermes-agent"
+if [ -d "${SRC}" ]; then
+    mkdir -p "${KEEP_DIR}/server/lib/node_modules"
+    if [ -d "${KEEP_DIR}/server/lib/node_modules/hermes-agent" ]; then
+        log_msg "keep already exists, skip move"
+    else
+        log_msg "moving agent runtime -> ${KEEP_DIR}"
+        mv "${SRC}" "${KEEP_DIR}/server/lib/node_modules/" 2>/dev/null \
+            || cp -a "${SRC}" "${KEEP_DIR}/server/lib/node_modules/" 2>/dev/null \
+            || log_msg "WARN: move failed"
+    fi
+else
+    log_msg "no agent runtime at ${SRC} (fresh install?)"
+fi
+
+# node-pty 的 Linux 原生模块无法在安装期编译（无 g++、npm 包不含 linux prebuilds），
+# 必须把已编译好的 pty.node 带过去，否则新装的控制台没有 Web 终端。
+PTY_SRC="${TRIM_APPDEST}/server/lib/node_modules/hermes-web-ui/node_modules/node-pty/build/Release/pty.node"
+if [ -f "${PTY_SRC}" ]; then
+    mkdir -p "${KEEP_DIR}"
+    if cp -a "${PTY_SRC}" "${KEEP_DIR}/pty.node" 2>/dev/null; then
+        log_msg "pty.node stashed -> ${KEEP_DIR}/pty.node ($(stat -c %s "${KEEP_DIR}/pty.node") B)"
+    else
+        log_msg "WARN: failed to stash pty.node"
+    fi
+else
+    log_msg "no pty.node found to stash"
+fi
+
+# 停掉旧进程，避免升级期间文件被占用
+for p in "${TRIM_APPDEST}/server/lib/node_modules/hermes-web-ui" \
+         "${TRIM_APPDEST}/server/lib/node_modules/hermes-agent/venv/bin/hermes"; do
+    pkill -f "${p}" 2>/dev/null || true
+done
+pkill -f "ekko-studio-mcp.mjs" 2>/dev/null || true
+log_msg "upgrade_init done"
+exit 0

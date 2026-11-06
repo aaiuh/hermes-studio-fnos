@@ -1,0 +1,18 @@
+[
+  {
+    "stepTitle": "卸载选项",
+    "items": [
+      {
+        "type": "radio",
+        "field": "wizard_data_action",
+        "label": "是否删除应用运行数据？",
+        "initValue": "keep",
+        "options": [
+          { "label": "保留（推荐，重新安装可继续使用）", "value": "keep" },
+          { "label": "删除运行数据（仅清 npm 前缀与升级暂存，不动对话与记忆）", "value": "delete" }
+        ],
+        "helpText": "你的会话、记忆、profile 与配置保存在应用共享目录下，<b>两个选项都不会删除它们</b>。"
+      }
+    ]
+  }
+]

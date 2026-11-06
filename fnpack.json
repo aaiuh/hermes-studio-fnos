@@ -1,0 +1,59 @@
+{
+  "schema_version": "2",
+  "source_info": {
+    "name": "Hermes Studio 飞牛源",
+    "author": "aaiuh",
+    "homepage": "https://github.com/aaiuh/hermes-studio-fnos",
+    "description": "Hermes Studio 的飞牛 fnOS 原生封装：内嵌官方 Agent 运行时，支持全新安装、fpk 内更新与飞牛应用数据备份。"
+  },
+  "apps": {
+    "Hermes": {
+      "display_name": "Hermes Studio",
+      "desc": "Hermes Agent 的图形控制台与运行时，原生运行于飞牛 fnOS，不依赖 Docker。内嵌官方 Agent 运行时（全新安装即可用），控制台可在 Studio 内直接更新，支持飞牛应用备份与恢复。依赖系统应用 Node.js 24（不随包携带）。",
+      "platform": [
+        "x86"
+      ],
+      "categories": [
+        "AI赋能"
+      ],
+      "icon_url": "https://raw.githubusercontent.com/aaiuh/hermes-studio-fnos/main/ICON_256.PNG",
+      "preview_urls": [],
+      "readme_url": "https://github.com/aaiuh/hermes-studio-fnos#readme",
+      "bug_report_url": "https://github.com/aaiuh/hermes-studio-fnos/issues",
+      "maintainer": "aaiuh",
+      "maintainer_url": "https://github.com/aaiuh",
+      "distributor": "aaiuh",
+      "distributor_url": "https://github.com/aaiuh/hermes-studio-fnos",
+      "run_as": "package",
+      "install_type": "",
+      "is_docker": false,
+      "service_port": "8648",
+      "releases": {
+        "0.8.17-2": {
+          "changelog": "跟随官方 runtime（Agent 0.23.0，控制台 0.8.17）。内嵌官方 Agent 运行时，空白机器全新安装即可用；控制台可在 Studio 内直接更新；支持飞牛应用数据备份与还原。",
+          "updated_at": "2026-11-06",
+          "os_min_version": "1.1.0",
+          "packages": {
+            "x86": {
+              "download_url": "https://github.com/aaiuh/hermes-studio-fnos/releases/download/v0.8.17-2/Hermes.fpk",
+              "sha256": "fea9e13fe251ee1fe2c1e0ee73ea82116aa81c60aaf23160261f051fc6326796",
+              "size": 540163898
+            }
+          }
+        },
+        "0.8.17-4": {
+          "changelog": "跟随官方 runtime（Agent 0.23.0，控制台 0.8.17）。内嵌官方 Agent 运行时，空白机器全新安装即可用；控制台可在 Studio 内直接更新；支持飞牛应用数据备份与还原。",
+          "updated_at": "2026-11-06",
+          "os_min_version": "1.1.0",
+          "packages": {
+            "x86": {
+              "download_url": "https://github.com/aaiuh/hermes-studio-fnos/releases/download/v0.8.17-4/./Hermes.fpk",
+              "sha256": "a17633fe6cbf7547f9e4353136c9ff95945ab8bdacbaf0ed98d83bc385fc422b",
+              "size": 540165010
+            }
+          }
+        }
+      }
+    }
+  }
+}

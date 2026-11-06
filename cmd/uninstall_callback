@@ -1,0 +1,32 @@
+#!/bin/bash
+# 卸载回调。
+# 🔴 只删应用运行时目录（@appdata/<app>）与 npm 前缀，绝不动 data-share（HOME）。
+#    旧包这里是 `rm -rf $TRIM_PKGVAR $TRIM_DATA_SHARE_PATHS`，
+#    TRIM_DATA_SHARE_PATHS = /vol1/@appshare/Hermes = 整个 HOME，
+#    一旦在向导里选「删除数据」，全部 profile / 记忆 / 会话会一起消失。
+set -u
+TRIM_PKGVAR="${TRIM_PKGVAR:-/vol1/@appdata/Hermes}"
+HOME_ROOT="${TRIM_DATA_SHARE_PATHS%%:*}"
+[ -n "${HOME_ROOT}" ] || HOME_ROOT="/vol1/@appshare/Hermes"
+LOG_FILE="${TRIM_PKGVAR}/info.log"
+log_msg() { echo "$(date '+%Y-%m-%d %H:%M:%S') - [uninstall] $1" >> "${LOG_FILE}" 2>/dev/null || true; }
+
+ACTION="${wizard_data_action:-keep}"
+log_msg "uninstall start, wizard_data_action=${ACTION}"
+
+# 停进程
+pkill -f "${TRIM_APPDEST:-/vol1/@appcenter/Hermes}/server/lib/node_modules/hermes-web-ui" 2>/dev/null || true
+pkill -f "${TRIM_PKGVAR}/npm/lib/node_modules/hermes-web-ui" 2>/dev/null || true
+pkill -f "ekko-studio-mcp.mjs" 2>/dev/null || true
+
+if [ "${ACTION}" = "delete" ]; then
+    log_msg "deleting app-owned data: ${TRIM_PKGVAR} and ${HOME_ROOT}/.upgrade-keep"
+    rm -rf "${TRIM_PKGVAR}/npm" 2>/dev/null || true
+    rm -rf "${HOME_ROOT}/.upgrade-keep" 2>/dev/null || true
+    # 明确不删 ${HOME_ROOT}/.hermes 与 ${HOME_ROOT}/.hermes-web-ui
+    log_msg "user data preserved: ${HOME_ROOT}/.hermes, ${HOME_ROOT}/.hermes-web-ui"
+else
+    log_msg "keeping all data"
+fi
+
+exit 0

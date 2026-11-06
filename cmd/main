@@ -1,0 +1,205 @@
+#!/bin/bash
+# Hermes Studio — 飞牛 fnOS 生命周期管理
+#
+# 关键设计（决定「能否在 Studio 内更新」）：
+#   控制台的 npm 全局前缀 = $TRIM_PKGVAR/node，而启动也从同一前缀读 hermes-web-ui。
+#   Studio 自带的更新会往 `npm root -g` 装包，装与被装的、启动读的必须是同一处，
+#   否则更新完重启仍是旧版（上一版包的故障就是「装到 @appdata、从 @appcenter 启动」）。
+#
+#   控制台代码（hermes-web-ui）  → $TRIM_PKGVAR/node/lib/node_modules  （可变，跟上游）
+#   Agent 运行时（hermes-agent） → $TRIM_APPDEST/server/lib/node_modules（随包升级，升级时暂存）
+
+set -u
+
+TRIM_APPDEST="${TRIM_APPDEST:-}"
+TRIM_PKGVar_TMP="${TRIM_PKGVAR:-}"
+TRIM_PKGHOME="${TRIM_PKGHOME:-}"
+
+APP_LINK="/var/apps/Hermes"
+
+_resolve_paths() {
+    if { [ -z "${TRIM_APPDEST}" ] || [ ! -d "${TRIM_APPDEST}" ]; } && [ -e "${APP_LINK}" ]; then
+        TRIM_APPDEST="$(readlink -f "${APP_LINK}" 2>/dev/null)"
+    fi
+    if { [ -z "${TRIM_PKGVAR}" ] || [ ! -d "${TRIM_PKGVAR}" ]; } && [ -L "${APP_LINK}/var" ]; then
+        TRIM_PKGVAR="$(readlink -f "${APP_LINK}/var" 2>/dev/null)"
+    fi
+    if { [ -z "${TRIM_PKGHOME}" ] || [ ! -d "${TRIM_PKGHOME}" ]; } && [ -L "${APP_LINK}/home" ]; then
+        TRIM_PKGHOME="$(readlink -f "${APP_LINK}/home" 2>/dev/null)"
+    fi
+    if [ -z "${TRIM_PKGVAR}" ] && [ -n "${TRIM_APPDEST}" ]; then
+        _pv="$(echo "${TRIM_APPDEST}" | sed 's|/@appcenter/|/@appdata/|')"
+        [ -d "${_pv}" ] && TRIM_PKGVAR="${_pv}"
+    fi
+    if [ -z "${TRIM_PKGHOME}" ] && [ -n "${TRIM_APPDEST}" ]; then
+        _ph="$(echo "${TRIM_APPDEST}" | sed 's|/@appcenter/|/@apphome/|')"
+        [ -d "${_ph}" ] && TRIM_PKGHOME="${_ph}"
+    fi
+}
+_resolve_paths
+
+if [ -z "${TRIM_APPDEST}" ] || [ ! -d "${TRIM_APPDEST}" ]; then
+    echo "ERROR: cannot resolve TRIM_APPDEST ('${TRIM_APPDEST}')" >&2
+    exit 1
+fi
+TRIM_PKGVAR="${TRIM_PKGVAR:-${TRIM_APPDEST%/@appcenter/*}/@appdata/Hermes}"
+
+# 用户数据根（data-share），与旧版保持一致，升级不迁移
+HOME_ROOT="${TRIM_DATA_SHARE_PATHS%%:*}"
+[ -n "${HOME_ROOT}" ] || HOME_ROOT="/vol1/@appshare/Hermes"
+
+HERMES_HOME="${HOME_ROOT}/.hermes"
+WEB_UI_HOME="${HOME_ROOT}/.hermes-web-ui"
+# npm 全局前缀必须可写且与启动路径一致 —— 系统 nodejs_v24 的 prefix 在其只读应用目录，
+# 直接用它会让 Studio 内置更新写入失败。这里显式指到应用数据目录。
+NPM_PREFIX="${TRIM_PKGVAR}/npm"
+AGENT_ROOT="${TRIM_APPDEST}/server/lib/node_modules/hermes-agent/runtime/hermes-agent"
+LOG_FILE="${TRIM_PKGVAR}/info.log"
+PID_FILE="${WEB_UI_HOME}/server.pid"
+PORT="${HERMES_PORT:-8648}"
+
+log_msg() { echo "$(date '+%Y-%m-%d %H:%M:%S') - [main] $1" >> "${LOG_FILE}" 2>/dev/null || true; }
+
+# 解析控制台入口：优先 npm 全局（Studio 自更新装的），回落包内
+resolve_bin() {
+    for cand in \
+        "${NPM_PREFIX}/lib/node_modules/hermes-web-ui/bin/hermes-web-ui.mjs" \
+        "${TRIM_APPDEST}/server/lib/node_modules/hermes-web-ui/bin/hermes-web-ui.mjs"
+    do
+        [ -f "${cand}" ] && { echo "${cand}"; return 0; }
+    done
+    return 1
+}
+
+resolve_node() {
+    for cand in \
+        "${NPM_PREFIX}/bin/node" \
+        /var/apps/nodejs_v24/target/bin/node \
+        /var/apps/nodejs_v22/target/bin/node
+    do
+        [ -x "${cand}" ] && { echo "${cand}"; return 0; }
+    done
+    command -v node 2>/dev/null && return 0
+    return 1
+}
+
+# 只杀本应用专属路径的进程 —— 绝不用 dist/server/index.js 这类宽泛模式，
+# 会误杀同机其它应用（含 Docker 版）的同名进程。
+kill_own() {
+    for pat in \
+        "${TRIM_APPDEST}/server/lib/node_modules/hermes-web-ui" \
+        "${NPM_PREFIX}/lib/node_modules/hermes-web-ui" \
+        "${AGENT_ROOT}/venv/bin/hermes" \
+        "${HERMES_HOME}/.hermes-web-ui"
+    do
+        pkill -f "${pat}" 2>/dev/null || true
+    done
+    # MCP 子进程通过本应用 node 路径启动，按 node 路径 + 脚本名双锚定
+    pkill -f "ekko-studio-mcp.mjs" 2>/dev/null || true
+}
+
+is_running() {
+    if [ -f "${PID_FILE}" ]; then
+        _pid="$(head -n 1 "${PID_FILE}" 2>/dev/null | tr -d '[:space:]')"
+        if [ -n "${_pid}" ] && kill -0 "${_pid}" 2>/dev/null; then
+            return 0
+        fi
+        rm -f "${PID_FILE}" 2>/dev/null || true
+    fi
+    return 1
+}
+
+port_open() {
+    (exec 3<>"/dev/tcp/127.0.0.1/${PORT}") 2>/dev/null && { exec 3>&- 2>/dev/null; return 0; }
+    return 1
+}
+
+start_process() {
+    if is_running || port_open; then
+        log_msg "already running (port ${PORT})"
+        return 0
+    fi
+
+    local node_bin hermes_bin
+    node_bin="$(resolve_node)" || { log_msg "ERROR: node runtime not found"; echo "ERROR: Node.js runtime not found. Install nodejs_v24." >&2; return 1; }
+    hermes_bin="$(resolve_bin)" || { log_msg "ERROR: hermes-web-ui not installed"; echo "ERROR: hermes-web-ui missing in ${NPM_PREFIX} or package server/. Reinstall the app." >&2; return 1; }
+
+    if [ ! -x "${AGENT_ROOT}/venv/bin/hermes" ]; then
+        log_msg "WARN: agent runtime missing at ${AGENT_ROOT}"
+    fi
+
+    mkdir -p "${WEB_UI_HOME}" "${HERMES_HOME}" 2>/dev/null || true
+
+    export HOME="${HOME_ROOT}"
+    export PATH="${NPM_PREFIX}/bin:${TRIM_APPDEST}/server/bin:$(dirname "${node_bin}"):/usr/local/bin:/usr/bin:/bin:${PATH}"
+    export HERMES_HOME
+    export HERMES_WEB_UI_HOME="${WEB_UI_HOME}"
+    export HERMES_AGENT_ROOT="${TRIM_APPDEST}/server/lib/node_modules/hermes-agent/runtime/hermes-agent"
+    export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=2048"
+
+    log_msg "starting: node=${node_bin} bin=${hermes_bin} port=${PORT}"
+    nohup "${node_bin}" "${hermes_bin}" start --port "${PORT}" --no-open >> "${LOG_FILE}" 2>&1 &
+    local newpid=$!
+    echo "${newpid}" > "${PID_FILE}" 2>/dev/null || true
+
+    local i=0
+    while [ "${i}" -lt 60 ]; do
+        if port_open; then
+            log_msg "port ${PORT} listening after ${i}s (pid=${newpid})"
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+
+    log_msg "ERROR: port ${PORT} not listening after 60s"
+    return 1
+}
+
+stop_process() {
+    if [ -f "${PID_FILE}" ]; then
+        _pid="$(head -n 1 "${PID_FILE}" 2>/dev/null | tr -d '[:space:]')"
+        if [ -n "${_pid}" ] && kill -0 "${_pid}" 2>/dev/null; then
+            log_msg "stopping pid=${_pid}"
+            kill -TERM "${_pid}" 2>/dev/null || true
+            local i=0
+            while kill -0 "${_pid}" 2>/dev/null && [ "${i}" -lt 10 ]; do
+                sleep 1
+                i=$((i + 1))
+            done
+            kill -0 "${_pid}" 2>/dev/null && kill -KILL "${_pid}" 2>/dev/null || true
+        fi
+        rm -f "${PID_FILE}" 2>/dev/null || true
+    fi
+    kill_own
+    sleep 1
+    return 0
+}
+
+case "$1" in
+start)
+    start_process
+    exit $?
+    ;;
+stop)
+    stop_process
+    exit 0
+    ;;
+restart)
+    stop_process
+    start_process
+    exit $?
+    ;;
+status)
+    if is_running; then
+        exit 0
+    elif port_open; then
+        exit 0
+    else
+        exit 3
+    fi
+    ;;
+*)
+    exit 1
+    ;;
+esac

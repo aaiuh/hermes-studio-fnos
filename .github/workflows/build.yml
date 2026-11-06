@@ -1,0 +1,351 @@
+name: build-fpk
+
+# fpk 内嵌官方 Agent runtime，所以「全新安装」和「升级」都能用。
+# 判据只看 runtime 版本：控制台 hermes-web-ui 在 Studio 内自行更新，不必重打本包。
+#   runtime 变 → 重打 fpk（约 545 MB）
+#   runtime 未变 → 整段跳过，不产生空 Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      runtime_tag:
+        description: "runtime Release tag（留空 = 自动取最新 hermes-<ver>-runtime）"
+        required: false
+        type: string
+      webui_version:
+        description: "hermes-web-ui 版本（留空 = npm latest）"
+        required: false
+        type: string
+      rev:
+        description: "打包修订号（留空 = 自动）"
+        required: false
+        type: string
+      force:
+        description: "runtime 未变也强制重打"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "17 */6 * * *"
+  push:
+    branches: [main]
+    paths:
+      - "manifest"
+      - "cmd/**"
+      - "config/**"
+      - "wizard/**"
+      - "app/ui/**"
+      - "app/vendor/**"
+      - "build/**"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-fpk
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      need: ${{ steps.dec.outputs.need }}
+      runtime_tag: ${{ steps.dec.outputs.runtime_tag }}
+      agent_ver: ${{ steps.dec.outputs.agent_ver }}
+      webui: ${{ steps.dec.outputs.webui }}
+      rev: ${{ steps.dec.outputs.rev }}
+      tag: ${{ steps.dec.outputs.tag }}
+      sig: ${{ steps.dec.outputs.sig }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: 解析 runtime 与控制台版本
+        id: dec
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN_RT: ${{ inputs.runtime_tag }}
+          IN_WEBUI: ${{ inputs.webui_version }}
+          IN_REV: ${{ inputs.rev }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          # ① runtime：官方 Ekko Studio 的 hermes-<ver>-runtime Release
+          if [ -n "${IN_RT:-}" ]; then
+            RT="${IN_RT}"
+          else
+            RT="$(gh release list --repo EKKOLearnAI/ekko-studio --limit 80 \
+                  --json tagName -q '.[].tagName' \
+                  | grep -E '^hermes-[0-9]+\.[0-9]+\.[0-9]+-runtime$' | sort -V | tail -1)"
+          fi
+          [ -n "${RT}" ] || { echo "::error::找不到 runtime Release"; exit 1; }
+
+          gh release view "$RT" --repo EKKOLearnAI/ekko-studio --json assets -q '.assets[].name' | tee rt-assets.txt
+          AGENT="$(echo "$RT" | sed -E 's/^hermes-(.*)-runtime$/\1/')"
+
+          # ② 控制台版本（只用于 manifest 展示与安装目标）
+          if [ -n "${IN_WEBUI:-}" ]; then
+            WEBUI="${IN_WEBUI}"
+          else
+            WEBUI="$(npm view hermes-web-ui dist-tags.latest 2>/dev/null | tr -d '[:space:]')"
+          fi
+          [ -n "${WEBUI}" ] || { echo "::error::无法解析 hermes-web-ui 版本"; exit 1; }
+
+          PREV="$(tr -d '[:space:]' < upstream.txt 2>/dev/null || echo '')"
+          echo "runtime        : ${RT}"
+          echo "agent          : ${AGENT}"
+          echo "web-ui         : ${WEBUI}"
+          echo "已构建 runtime  : ${PREV:-（无）}"
+
+          # ③ 包内容签名：manifest/cmd/config/wizard/app/build 任一变化都必须重打，
+          #    否则新增钩子（如飞牛备份）会被「runtime 未变」错误跳过。
+          SIG="$(find manifest cmd config wizard app build -type f 2>/dev/null \
+                  | LC_ALL=C sort \
+                  | xargs -r sha256sum 2>/dev/null \
+                  | sha256sum | cut -d" " -f1)"
+          PREV_SIG="$(tr -d '[:space:]' < pkgsig.txt 2>/dev/null || echo '')"
+          echo "包内容签名    : ${SIG:0:16}…"
+          echo "上次构建签名  : ${PREV_SIG:0:16}…"
+
+          NEED=true
+          if [ "${RT}" = "${PREV}" ] && [ "${SIG}" = "${PREV_SIG}" ] && [ "${FORCE}" != "true" ]; then
+            NEED=false
+          fi
+
+          REV="${IN_REV:-}"
+          if [ -z "${REV}" ]; then
+            if [ "${RT}" = "${PREV}" ]; then
+              LAST="$(git ls-remote --tags origin 2>/dev/null | grep -oE "v[0-9.]+-[0-9]+$" | sed 's/.*-//' | sort -n | tail -1 || true)"
+              REV=$(( ${LAST:-0} + 1 ))
+            else
+              REV=1
+            fi
+          fi
+
+          {
+            echo "need=${NEED}"
+            echo "runtime_tag=${RT}"
+            echo "agent_ver=${AGENT}"
+            echo "webui=${WEBUI}"
+            echo "rev=${REV}"
+            echo "sig=${SIG}"
+            echo "tag=v${WEBUI}-${REV}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.need == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 缓存官方 runtime
+        id: rtcache
+        uses: actions/cache@v4
+        with:
+          path: app/runtime.tar.gz
+          key: runtime-${{ needs.resolve.outputs.runtime_tag }}
+
+      - name: 下载官方 runtime 并校验
+        if: steps.rtcache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RT: ${{ needs.resolve.outputs.runtime_tag }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/rt && mkdir -p /tmp/rt
+          gh release download "$RT" --repo EKKOLearnAI/ekko-studio \
+            --pattern "hermes-runtime-hermes-agent-*-linux-x64.tar.gz" \
+            --pattern "hermes-runtime-linux-x64.json" --dir /tmp/rt
+          TAR=$(ls /tmp/rt/*.tar.gz)
+          EXP=$(python3 -c "import json;print(json.load(open('/tmp/rt/hermes-runtime-linux-x64.json'))['asset']['sha256'])")
+          GOT=$(sha256sum "$TAR" | cut -d' ' -f1)
+          echo "sha256 expected=$EXP"
+          echo "sha256 got     =$GOT"
+          [ "$EXP" = "$GOT" ] || { echo "::error::runtime sha256 不一致"; exit 1; }
+          mkdir -p app
+          cp "$TAR" app/runtime.tar.gz
+          ls -l app/runtime.tar.gz
+
+      - name: 校验 runtime 结构
+        run: |
+          set -eu
+          tar tzf app/runtime.tar.gz > /tmp/rtlist.txt 2>/dev/null
+          echo "runtime 条目: $(wc -l < /tmp/rtlist.txt)"
+          grep -qE "\.?/?python/venv/bin/hermes$" /tmp/rtlist.txt \
+            || { echo "::error::runtime 内没有 python/venv/bin/hermes，安装脚本找不到 Agent"; exit 1; }
+          grep -qE "\.?/?python/venv/bin/python3\.[0-9]+$" /tmp/rtlist.txt \
+            || { echo "::error::venv 缺解释器"; exit 1; }
+          echo "✓ runtime 结构符合 install_callback 的预期"
+
+      - name: 安装 fnpack
+        run: |
+          set -euo pipefail
+          curl -sSL --max-time 180 \
+            https://static2.fnnas.com/fnpack/fnpack-1.2.3-linux-amd64 -o /tmp/fnpack
+          chmod +x /tmp/fnpack
+          sudo mv /tmp/fnpack /usr/local/bin/fnpack
+          # 不要写成 `fnpack --help | head -3`：set -o pipefail 下 head 提前关闭管道会触发 SIGPIPE，exit 141 让整步失败
+          fnpack --help > /tmp/fnpack-help.txt 2>&1 || true
+          head -3 /tmp/fnpack-help.txt
+
+      - name: 写入版本
+        env:
+          WEBUI: ${{ needs.resolve.outputs.webui }}
+          AGENT: ${{ needs.resolve.outputs.agent_ver }}
+        run: |
+          set -euo pipefail
+          echo "${WEBUI}" | tr -d '[:space:]' > VERSION
+          echo "${AGENT}" | tr -d '[:space:]' > AGENT_VERSION
+          cp -f VERSION app/VERSION
+          cp -f AGENT_VERSION app/AGENT_VERSION
+          echo "VERSION=$(cat VERSION) AGENT_VERSION=$(cat AGENT_VERSION)"
+
+      - name: 校验脚本与向导
+        run: |
+          set -euo pipefail
+          for f in cmd/*; do bash -n "$f" || { echo "::error::$f 语法错误"; exit 1; }; done
+          for f in wizard/*; do python3 -c "import json;json.load(open('$f'))" || { echo "::error::wizard/$f JSON 非法"; exit 1; }; done
+          python3 -c "import json;[json.load(open(p)) for p in ['config/privilege','config/resource']]"
+          grep -q '"field": *"port"' wizard/install || { echo "::error::wizard/install 缺 port 字段"; exit 1; }
+          echo "全部通过"
+
+      - name: 打包
+        env:
+          REV: ${{ needs.resolve.outputs.rev }}
+        run: |
+          set -euo pipefail
+          bash build/build.sh
+          FPK="$(ls -1 ./*.fpk | head -1)"
+          echo "FPK_NAME=$(basename "$FPK")" >> "$GITHUB_ENV"
+          echo "FPK_SIZE=$(stat -c %s "$FPK")" >> "$GITHUB_ENV"
+          echo "FPK_SHA=$(sha256sum "$FPK" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          echo "产物: $FPK $(stat -c %s "$FPK") B sha256=$(sha256sum "$FPK" | cut -d' ' -f1)"
+
+      - name: 解包自检
+        run: |
+          set -euo pipefail
+          FPK="$(ls -1 ./*.fpk | head -1)"
+          [ "$(od -An -tx1 -N2 "$FPK" | tr -d ' \n')" = "1f8b" ] || { echo "::error::不是 gzip，安装报 10111"; exit 1; }
+
+          rm -rf /tmp/chk && mkdir -p /tmp/chk
+          tar xzf "$FPK" -C /tmp/chk
+          for f in manifest cmd/main cmd/install_init cmd/install_callback cmd/uninstall_init \
+                   cmd/uninstall_callback cmd/upgrade_init cmd/upgrade_callback \
+                   cmd/config_init cmd/config_callback cmd/backup_callback cmd/restore_callback \
+                   config/privilege config/resource \
+                   wizard/install wizard/config wizard/uninstall app.tgz; do
+            [ -e "/tmp/chk/$f" ] || { echo "::error::包内缺 $f"; exit 1; }
+          done
+          grep -qE "^(appname|version|desktop_uidir|desktop_applaunchname)[[:space:]]*=" /tmp/chk/manifest \
+            || { echo "::error::manifest 缺必需字段"; exit 1; }
+          grep -qE "^checksum[[:space:]]*=" /tmp/chk/manifest || { echo "::error::缺 checksum"; exit 1; }
+
+          rm -rf /tmp/appchk && mkdir -p /tmp/appchk
+          tar xzf /tmp/chk/app.tgz -C /tmp/appchk
+          for f in VERSION AGENT_VERSION ui/config ui/images/icon_256.png ui/images/icon_64.png \
+                   runtime.tar.gz vendor/pty.node; do
+            [ -e "/tmp/appchk/$f" ] || { echo "::error::app.tgz 缺 $f"; exit 1; }
+          done
+          echo "runtime: $(stat -c %s /tmp/appchk/runtime.tar.gz) B"
+          echo "pty.node: $(stat -c %s /tmp/appchk/vendor/pty.node) B"
+
+          grep -q '"\${port}"' /tmp/appchk/ui/config || echo "::warning::ui/config 未用 \${port} 占位符"
+          # 飞牛「应用数据备份」钩子：必须存在、可执行，且不是空壳
+          for f in cmd/backup_callback cmd/restore_callback; do
+            [ -x "/tmp/chk/$f" ] || { echo "::error::$f 不可执行（应用数据备份会失效）"; exit 1; }
+            [ "$(stat -c %s "/tmp/chk/$f")" -gt 800 ] || { echo "::error::$f 内容过少"; exit 1; }
+          done
+          grep -q 'TRIM_BACKUP' /tmp/chk/cmd/backup_callback || { echo "::error::backup_callback 未使用 TRIM_BACKUP_DIR"; exit 1; }
+          grep -q 'TRIM_BACKUP' /tmp/chk/cmd/restore_callback || { echo "::error::restore_callback 未使用 TRIM_BACKUP_DIR"; exit 1; }
+          grep -q 'export PATH="\${NODE_DIR}' /tmp/chk/cmd/install_callback \
+            || { echo "::error::install_callback 缺 node PATH 修复（npm 会因 /usr/bin/env: node 报错而失败）"; exit 1; }
+          grep -q 'runtime tar = ' /tmp/chk/cmd/install_callback \
+            || { echo "::error::install_callback 缺 runtime.tar.gz 多路径探测"; exit 1; }
+          echo "✓ 备份/还原钩子与安装脚本检查通过"
+
+          echo "✓ 自检通过（含 runtime 与预编译原生模块）"
+
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          WEBUI: ${{ needs.resolve.outputs.webui }}
+          AGENT: ${{ needs.resolve.outputs.agent_ver }}
+          RT: ${{ needs.resolve.outputs.runtime_tag }}
+        run: |
+          set -euo pipefail
+          FPK="$(ls -1 ./*.fpk | head -1)"
+          NOTE="内嵌官方 Agent runtime \`${RT}\`（hermes-agent ${AGENT}），控制台 hermes-web-ui ${WEBUI}。
+
+          - **全新安装可用**：安装时解压包内 runtime，venv 为相对软链，不依赖外网
+          - **控制台可自更新**：hermes-web-ui 走可写 npm 前缀，Studio 内检查更新即可，无需重打本包
+          - **升级保留数据**：Agent runtime 升级前暂存于应用共享目录 .upgrade-keep，对话与记忆始终不动
+          - **Web 终端可用**：包内附 node-pty 1.1.0 的 linux-x64 预编译模块（飞牛无 g++，装不了即编译）
+
+          sha256: ${FPK_SHA}
+          大小: ${FPK_SIZE} B"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$FPK" --clobber
+          else
+            gh release create "$TAG" "$FPK" --title "Hermes Studio ${TAG#v}" --notes "$NOTE"
+          fi
+
+      - name: 生成集合源索引 fnpack.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          FPK: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          FPKFILE="$(ls -1 ./*.fpk 2>/dev/null | head -1 || true)"
+          [ -n "${FPKFILE}" ] || { echo "::warning::没有本地 fpk，索引改用 Release 实测值"; FPKFILE="Hermes.fpk"; }
+          python3 build/make_index.py "$FPKFILE"
+          python3 - <<'PY'
+          import json
+          d = json.load(open("fnpack.json", encoding="utf-8"))
+          app = d["apps"]["Hermes"]
+          rels = app["releases"]
+          assert rels, "fnpack.json 没有 releases"
+          for v, r in rels.items():
+              pkg = r["packages"]["x86"]
+              assert pkg["download_url"].startswith("https://github.com/"), "下载地址不是 GitHub"
+              assert len(pkg["sha256"]) == 64 and pkg["size"] > 0, "sha256/size 异常"
+          print("索引自检通过：", ", ".join(rels.keys()))
+          PY
+
+      - name: 提交 runtime 锚点
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          echo "${{ needs.resolve.outputs.runtime_tag }}" | tr -d '[:space:]' > upstream.txt
+          echo "${{ needs.resolve.outputs.sig }}" | tr -d '[:space:]' > pkgsig.txt
+          # 让仓库里的 VERSION / AGENT_VERSION 与刚发出去的包一致，避免 README 与实物对不上
+          echo "${{ needs.resolve.outputs.webui }}"     | tr -d '[:space:]' > VERSION
+          echo "${{ needs.resolve.outputs.agent_ver }}" | tr -d '[:space:]' > AGENT_VERSION
+          git add upstream.txt pkgsig.txt VERSION AGENT_VERSION fnpack.json manifest app/VERSION app/AGENT_VERSION 2>/dev/null || true
+          if git diff --cached --quiet; then echo "无变更"; exit 0; fi
+          git commit -m "chore: 锚点 runtime=$(cat upstream.txt) pkg=$(cut -c1-12 pkgsig.txt)"
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then echo "已推送"; exit 0; fi
+            echo "push 失败，第 ${attempt} 次重试"
+            # 构建期 build.sh 会改写工作区文件，rebase 会因此报 "You have unstaged changes"
+            git reset --hard HEAD
+            git fetch origin main
+            git rebase origin/main || { git rebase --abort; exit 1; }
+            sleep 5
+          done
+          echo "::error::提交失败"; exit 1
+
+      - name: 清理构建产物
+        if: always()
+        run: |
+          rm -f app/runtime.tar.gz ./*.fpk 2>/dev/null || true

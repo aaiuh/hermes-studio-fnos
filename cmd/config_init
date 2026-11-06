@@ -1,0 +1,5 @@
+#!/bin/bash
+# config_init: 仅建日志目录，不做实质改动
+set -u
+mkdir -p "${TRIM_PKGVAR:-/vol1/@appdata/Hermes}" 2>/dev/null || true
+exit 0

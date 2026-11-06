@@ -1,0 +1,159 @@
+name: inspect-runtime
+
+# 一次性诊断：下载官方 runtime 包，输出内部结构与关键文件，用来确定 fpk 内该怎么摆放。
+# 不发布 Release、不改仓库文件。
+
+on:
+  workflow_dispatch:
+    inputs:
+      runtime_tag:
+        description: "runtime Release tag（如 hermes-0.23.0-runtime）"
+        required: false
+        default: "hermes-0.23.0-runtime"
+        type: string
+      webui_tag:
+        description: "web-ui Release tag（如 v0.8.17），留空则跳过"
+        required: false
+        default: "v0.8.17"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 探测 runtime 架构名
+        id: probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RT: ${{ inputs.runtime_tag }}
+        run: |
+          set -euo pipefail
+          echo "rt=${RT}" >> "$GITHUB_OUTPUT"
+          # 列出该 Release 的全部资产，确认归档命名
+          gh release view "$RT" --repo EKKOLearnAI/ekko-studio --json assets \
+            -q '.assets[] | "\(.name)\t\(.size)"' | tee assets.txt
+
+      - name: 下载 linux-x64 runtime
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RT: ${{ inputs.runtime_tag }}
+        run: |
+          set -euo pipefail
+          gh release download "$RT" --repo EKKOLearnAI/ekko-studio \
+            --pattern "hermes-runtime-hermes-agent-*-linux-x64.tar.gz" \
+            --pattern "hermes-runtime-linux-x64.json" --dir dl
+          ls -l dl
+          echo "=== 校验 sha256 ==="
+          cat dl/hermes-runtime-linux-x64.json
+          EXP=$(python3 -c "import json;print(json.load(open('dl/hermes-runtime-linux-x64.json'))['asset']['sha256'])")
+          GOT=$(sha256sum dl/*.tar.gz | cut -d' ' -f1)
+          echo "expected=$EXP"
+          echo "got     =$GOT"
+          [ "$EXP" = "$GOT" ] && echo "✓ sha256 一致" || { echo "::error::sha256 不一致"; exit 1; }
+
+      - name: 输出顶层结构
+        run: |
+          set -eu
+          TAR=$(ls dl/*.tar.gz)
+          # 先把清单落盘：tar | head 会在 pipefail 下触发 SIGPIPE 把步骤打挂
+          tar tzf "$TAR" > list.txt 2>/dev/null
+          echo "条目总数: $(wc -l < list.txt)"
+
+          echo
+          echo "===== 顶层目录（depth<=2） ====="
+          awk -F/ 'NF<=2' list.txt | sort -u | head -50
+
+          echo
+          echo "===== 前 50 个条目 ====="
+          head -50 list.txt
+
+          echo
+          echo "===== 关键路径计数 ====="
+          for pat in "venv/bin/hermes" "bin/hermes.js" "package.json" "runtime-manifest" "pyproject.toml" "uv.lock" "node/bin/node" "\.git/HEAD"; do
+            n=$(grep -cE "$pat" list.txt || true)
+            printf "  %-28s %s\n" "$pat" "$n"
+          done
+
+          echo
+          echo "===== venv/bin/hermes 的完整路径 ====="
+          grep -E "venv/bin/hermes$" list.txt | head -5 || echo "  (无)"
+
+          echo
+          echo "===== .git/HEAD 的完整路径 ====="
+          grep -E "\.git/HEAD$" list.txt | head -5 || echo "  (无)"
+
+          echo
+          echo "===== 顶层 package.json ====="
+          for p in $(grep -E "^\.?/?package\.json$" list.txt | head -3); do
+            echo "--- $p"
+            tar xzf "$TAR" -O "$p" 2>/dev/null | head -25
+          done
+
+          echo
+          echo "===== 是否有 hermes_agent 源码特征 ====="
+          for pat in "hermes_cli/" "run_agent.py" "pyproject.toml" "SOUL.md" "AGENTS.md"; do
+            n=$(grep -c "$pat" list.txt || true)
+            printf "  %-22s %s\n" "$pat" "$n"
+          done
+
+      - name: 检查 venv 软链能否搬迁
+        run: |
+          set -eu
+          TAR=$(ls dl/*.tar.gz)
+          echo "===== 只解 venv/bin 与 runtime-manifest ====="
+          rm -rf vx && mkdir -p vx
+          tar xzf "$TAR" -C vx ./python/venv/bin ./runtime-manifest.json 2>/dev/null || \
+            tar xzf "$TAR" -C vx python/venv/bin runtime-manifest.json 2>/dev/null || true
+          find vx -maxdepth 4 | head -30
+          echo
+          echo "===== venv/bin 下每个文件的类型（软链目标是关键） ====="
+          ls -la vx/python/venv/bin/ 2>/dev/null || ls -la vx/venv/bin/ 2>/dev/null || echo "  (未解出)"
+          echo
+          echo "===== 软链目标是否指向构建机绝对路径 ====="
+          for f in vx/python/venv/bin/* vx/venv/bin/*; do
+            [ -L "$f" ] && echo "  LINK $(basename $f) -> $(readlink "$f")"
+          done 2>/dev/null || true
+          echo
+          echo "===== venv 的 pyvenv.cfg ====="
+          cat vx/python/venv/pyvenv.cfg 2>/dev/null || cat vx/venv/pyvenv.cfg 2>/dev/null || echo "  (不在 bin 目录内，稍后查)"
+          echo
+          echo "===== runtime-manifest.json ====="
+          cat vx/runtime-manifest.json 2>/dev/null || echo "  (未取到)"
+          echo
+          echo "===== 从清单里筛 venv 顶层条目（看解释器布局） ====="
+          grep -E "^\.?/?python/venv/[^/]+$" list.txt | head -20 || true
+          echo
+          echo "===== 清单里的 python 解释器候选 ====="
+          grep -E "^\.?/?python/venv/bin/(python|python3|python3\.[0-9]+)$" list.txt | head -10 || true
+      - name: 输出 web-ui 包结构（可选）
+        if: inputs.webui_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WT: ${{ inputs.webui_tag }}
+        run: |
+          set -eu
+          gh release download "$WT" --repo EKKOLearnAI/ekko-studio \
+            --pattern "hermes-web-ui-*.tar.gz" --pattern "hermes-web-ui-*.json" --dir wdl || true
+          ls -l wdl 2>/dev/null || { echo "下载失败，跳过"; exit 0; }
+          TAR=$(ls wdl/*.tar.gz 2>/dev/null | head -1)
+          [ -n "$TAR" ] || { echo "无 webui 归档"; exit 0; }
+          tar tzf "$TAR" > wlist.txt 2>/dev/null || true
+          echo "条目总数: $(wc -l < wlist.txt)"
+          echo
+          echo "===== webui 顶层 ====="
+          awk -F/ 'NF<=2' wlist.txt | sort -u | head -20
+          echo
+          echo "===== node-pty 相关 ====="
+          grep -i "node-pty" wlist.txt | head -20 || echo "  (无 node-pty)"
+          echo
+          echo "===== node-pty 的 .node 二进制（linux 编译产物是否存在） ====="
+          grep -E "node-pty.*\.node$" wlist.txt | head -20 || echo "  (无 .node)"
+          echo
+          echo "===== 是否含 linux-x64 prebuilds ====="
+          grep -E "node-pty/prebuilds/" wlist.txt | head -10 || echo "  (无 prebuilds)"
+          echo
+          echo "===== build/Release ====="
+          grep -E "node-pty/build/Release" wlist.txt | head -10 || echo "  (无 build/Release)"
