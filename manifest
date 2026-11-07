@@ -1,5 +1,5 @@
 appname                    = Hermes
-version = 0.8.19-9
+version = 0.8.19-10
 display_name               = Hermes Studio
 desc                       = <p>Hermes Studio 的飞牛 fnOS 原生封装：Hermes Agent 的桌面 / Web 控制台，支持与 AI 智能体流式对话、管理模型与配置、接入多平台渠道、自动化任务与本地数据持久化。</p><p>⭐本包复用系统已装的 Node.js 24 运行时，不打包 Node、不使用 Docker。控制台前端跟随上游 npm 发布自动更新，Agent 运行时随包升级。</p><p>📌使用说明：安装后等应用中心显示「运行中」再点图标；默认账号 admin / 123456，登录后请在「设置 → 模型」配置 API Key。会话、记忆与配置保存在应用共享目录下，升级与卸载都会保留。</p>
 platform                   = x86
